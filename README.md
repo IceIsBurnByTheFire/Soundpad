@@ -6,6 +6,7 @@ Like Voicemod, but free and simple.
 - 🔊 Play your own audio clips (mp3, wav, ogg, flac) so everyone in the call hears them
 - 🎙️ Your real voice still goes through at the same time, no switching mics
 - ⌨️ Hotkeys that work while you're in a game
+- 🖥️ Full-screen **Soundboard mode** with big pads you can drag into any order
 - 🤖 Voice effects: Chipmunk, Deep, Robot, Radio, Echo
 - 🎧 You hear the sounds too, and you can turn on "Hear myself" to check how you sound
 
@@ -157,6 +158,13 @@ Supported: mp3, wav, ogg, flac, aiff. The files get copied into the `sounds` fol
 - **Click a pad** to play it.
 - **Right-click a pad** for: hotkey, volume, color, play mode, rename, remove.
 - **Stop all** (top right) stops everything.
+- **Drag a pad** to move it. The other pads shift out of the way, and the new order is saved.
+
+### Soundboard mode (full screen)
+Click **Soundboard mode** at the top (or press **F11**) to show only your pads, full screen.
+The pads grow to fill the screen: a few sounds get huge pads, lots of sounds get smaller ones, and if there
+are too many to fit, you scroll. Great on a second monitor or a touchscreen.
+Press **Esc** (or **Exit** at the top right) to go back.
 
 ### Hotkeys
 Right-click a pad → **Set hotkey…**, then press the keys you want (e.g. `Ctrl + Alt + 1`).

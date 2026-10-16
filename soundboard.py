@@ -27,9 +27,11 @@ if IS_MAC:
     from pynput import keyboard as pkb
 else:
     import keyboard
-from PySide6.QtCore import Qt, QObject, Signal, QTimer, QRect, QRectF, QSize, QPoint, QPointF
-from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontDatabase, QFontMetrics,
-                           QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap)
+from PySide6.QtCore import (Qt, QObject, Signal, QTimer, QRect, QRectF, QSize, QPoint, QPointF,
+                            QMimeData, QEvent)
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QDrag, QFont, QFontDatabase, QFontMetrics,
+                           QIcon, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
+                           QShortcut)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
                                QHBoxLayout, QInputDialog, QLabel, QLayout, QLineEdit, QMainWindow,
                                QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider,
@@ -87,6 +89,7 @@ G_ADD, G_SETTINGS, G_MIC, G_SEARCH = "", "", "", ""
 G_PLAY, G_STOP, G_VOLUME, G_MUSIC = "", "", "", ""
 G_HEADPHONE, G_LOOP, G_KEYBOARD, G_DELETE = "", "", "", ""
 G_EDIT, G_FOLDER, G_GAME, G_GRID = "", "", "", ""
+G_FULL, G_EXITFULL = "", ""
 ICON_FONT = None                  # set in main(): a Segoe icon font, or None to draw icons
 MONO_FONT = "Menlo" if IS_MAC else "Consolas"
 
@@ -829,6 +832,14 @@ def _vector_glyph(p, ch, color):
         p.drawLine(P(8.5, 10.5), P(8.5, 14.5))
         p.drawPoint(P(15, 11.5))
         p.drawPoint(P(17.5, 14))
+    elif ch == G_FULL:              # corners pointing out
+        for pts in (((4, 9), (4, 4), (9, 4)), ((15, 4), (20, 4), (20, 9)),
+                    ((4, 15), (4, 20), (9, 20)), ((15, 20), (20, 20), (20, 15))):
+            p.drawPolyline([P(*q) for q in pts])
+    elif ch == G_EXITFULL:          # corners pointing in
+        for pts in (((4, 9), (9, 9), (9, 4)), ((15, 4), (15, 9), (20, 9)),
+                    ((4, 15), (9, 15), (9, 20)), ((15, 20), (15, 15), (20, 15))):
+            p.drawPolyline([P(*q) for q in pts])
     elif ch == G_GRID:
         for x, y in ((3.5, 3.5), (13.5, 3.5), (3.5, 13.5), (13.5, 13.5)):
             p.drawRoundedRect(QRectF(x, y, 7, 7), 1.5, 1.5)
@@ -960,11 +971,15 @@ class Bridge(QObject):
 
 
 class FlowGrid(QLayout):
-    """Responsive grid: as many equal-width columns as fit, fixed row height."""
+    """Responsive grid of equal pads.
+    Normal: as many columns as fit, fixed row height.
+    Fit (Soundboard mode, fit_h set): pads grow to fill the screen; too many -> big pads that scroll."""
 
     def __init__(self, min_w=210, row_h=150, spacing=14):
         super().__init__()
         self.items, self.min_w, self.row_h, self.sp = [], min_w, row_h, spacing
+        self.fit_h = 0              # available height in fit mode, 0 = normal mode
+        self.slots = []             # (items index, QRect) from the last layout, for drag & drop
 
     def addItem(self, item):
         self.items.append(item)
@@ -997,18 +1012,88 @@ class FlowGrid(QLayout):
     def minimumSize(self):
         return QSize(self.min_w, self.row_h)
 
+    def _metrics(self, w, n):
+        """(columns, pad width, pad height)."""
+        sp = self.sp
+        if self.fit_h and n:
+            best = None
+            for cols in range(1, n + 1):
+                rows = math.ceil(n / cols)
+                cw = (w - sp * (cols - 1)) / cols
+                rh = min((self.fit_h - sp * (rows - 1)) / rows, cw / 1.1, 460)
+                cw = min(cw, rh * 2.4)                     # not ribbon-wide
+                score = cw * rh
+                if best is None or score > best[0]:
+                    best = (score, cols, cw, rh)
+            _, cols, cw, rh = best
+            if rh >= 170 and cw >= 230:                    # everything fits on one screen
+                return cols, cw, rh
+            cols = max(1, int((w + sp) // (250 + sp)))       # too many: big pads + scrolling
+            return cols, (w - sp * (cols - 1)) / cols, 175
+        cols = max(1, int((w + sp) // (self.min_w + sp)))
+        return cols, (w - sp * (cols - 1)) / cols, self.row_h
+
     def _layout(self, rect, dry=False):
-        vis = [it for it in self.items if it.widget() and not it.widget().isHidden()]
+        vis = [i for i, it in enumerate(self.items) if it.widget() and not it.widget().isHidden()]
         w = max(rect.width(), self.min_w)
-        cols = max(1, (w + self.sp) // (self.min_w + self.sp))
-        cw = (w - self.sp * (cols - 1)) / cols
-        for i, it in enumerate(vis):
-            r, c = divmod(i, cols)
-            if not dry:
-                it.setGeometry(QRect(int(rect.x() + c * (cw + self.sp)),
-                                     rect.y() + r * (self.row_h + self.sp), int(cw), self.row_h))
+        cols, cw, rh = self._metrics(w, len(vis))
+        used = min(cols, len(vis)) * cw + self.sp * (min(cols, len(vis)) - 1)
+        x0 = rect.x() + max(0, (w - used) / 2) if self.fit_h else rect.x()   # center in fit mode
         rows = math.ceil(len(vis) / cols) if vis else 0
-        return rows * self.row_h + max(0, rows - 1) * self.sp
+        total = rows * rh + max(0, rows - 1) * self.sp
+        y0 = rect.y() + max(0, (self.fit_h - total) / 2) if self.fit_h else rect.y()
+        if not dry:
+            self.slots = []
+            for n, i in enumerate(vis):
+                r, c = divmod(n, cols)
+                g = QRect(int(x0 + c * (cw + self.sp)), int(y0 + r * (rh + self.sp)), int(cw), int(rh))
+                self.items[i].setGeometry(g)
+                self.slots.append((i, g))
+        return int(total + (y0 - rect.y()))
+
+    def index_at(self, pos):
+        """Index in self.items of the slot under (or nearest to) pos."""
+        if not self.slots:
+            return None
+        for i, g in self.slots:
+            if g.contains(pos):
+                return i
+        return min(self.slots, key=lambda s: (QPointF(s[1].center()) - QPointF(pos)).manhattanLength())[0]
+
+    def move(self, src, dst):
+        if src != dst:
+            self.items.insert(dst, self.items.pop(src))
+            self.invalidate()
+
+
+class DropGrid(QWidget):
+    """The widget holding the pads: reorders them while one is dragged over it."""
+    MIME = "application/x-soundpad-pad"
+
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasFormat(self.MIME):
+            e.acceptProposedAction()
+        else:
+            e.ignore()          # files: let the main window take them
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasFormat(self.MIME):
+            name = bytes(e.mimeData().data(self.MIME)).decode()
+            self.win.move_pad(name, e.position().toPoint())
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dropEvent(self, e):
+        if e.mimeData().hasFormat(self.MIME):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
 
 
 # ---------------------------------------------------------------- widgets
@@ -1019,14 +1104,15 @@ class Pad(QWidget):
     def __init__(self, win, entry):
         super().__init__()
         self.win, self.entry = win, entry
-        self.hover = self.down = False
+        self.hover = self.down = self.dragging = False
+        self.press_pos = QPoint()
         self.setCursor(Qt.PointingHandCursor)
         self.setAttribute(Qt.WA_Hover)
         dur = len(win.sounds[entry["name"]]) / SR if entry["name"] in win.sounds else 0
         self.duration = dur
         mode = dict((m, t) for m, t, _ in MODES)[entry.get("mode", "overlap")]
         self.setToolTip(f"{entry['name']}\nMode: {mode}   Volume: {int(entry['volume'] * 100)}%\n"
-                        "Click to play  ·  Right-click to edit")
+                        "Click to play  ·  Right-click to edit  ·  Drag to move")
 
     @property
     def name(self):
@@ -1043,7 +1129,13 @@ class Pad(QWidget):
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             self.down = True
+            self.press_pos = e.position().toPoint()
             self.update()
+
+    def mouseMoveEvent(self, e):
+        if self.down and (e.position().toPoint() - self.press_pos).manhattanLength()                 >= QApplication.startDragDistance():
+            self.down = False               # it's a drag, not a click
+            self.win.drag_pad(self)
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton and self.down:
@@ -1058,7 +1150,19 @@ class Pad(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        # Drawn at the normal pad size (about 260x150), then scaled up for big pads,
+        # so text, icon and chip all grow together.
+        k = max(1.0, min(self.height() / 150, self.width() / 260))
+        p.scale(k, k)
+        r = QRectF(0, 0, self.width() / k, self.height() / k).adjusted(1, 1, -1, -1)
+        if self.dragging:                   # the empty slot it will drop into
+            path = QPainterPath()
+            path.addRoundedRect(r, 16, 16)
+            p.setPen(QPen(QColor(ACCENT), 1.5, Qt.DashLine))
+            p.fillPath(path, QColor(124, 92, 255, 20))
+            p.drawPath(path)
+            p.end()
+            return
         if self.down:
             r = r.adjusted(2, 2, -2, -2)
         col = QColor(self.entry.get("color", ACCENT))
@@ -1280,7 +1384,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Soundboard")
         self.setWindowIcon(app_icon())
         self.resize(1180, 760)
-        self.setMinimumSize(900, 600)
+        self.setMinimumSize(1000, 620)
         self.setAcceptDrops(True)
         self.cfg = load_config()
         self.engine = Engine()
@@ -1304,7 +1408,11 @@ class MainWindow(QMainWindow):
         self.bridge.call.connect(lambda fn: fn())
         SOUNDS_DIR.mkdir(exist_ok=True)
 
+        self.board_mode = False
         self._build()
+        QShortcut(QKeySequence(Qt.Key_F11), self, self.toggle_board_mode)
+        QShortcut(QKeySequence(Qt.Key_Escape), self,
+                  lambda: self.board_mode and self.toggle_board_mode())
         self._load_sounds()
         self._rebuild_pads()
         self._bind_hotkeys()
@@ -1322,7 +1430,8 @@ class MainWindow(QMainWindow):
         h = QHBoxLayout(root)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(0)
-        h.addWidget(self._build_sidebar())
+        self.sidebar = self._build_sidebar()
+        h.addWidget(self.sidebar)
 
         right = QWidget()
         rv = QVBoxLayout(right)
@@ -1333,7 +1442,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_effects())
         self.stack.addWidget(self._build_settings())
         rv.addWidget(self.stack, 1)
-        rv.addWidget(self._build_mixer())
+        self.mixer = self._build_mixer()
+        rv.addWidget(self.mixer)
         h.addWidget(right, 1)
 
     def _build_sidebar(self):
@@ -1411,8 +1521,11 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(page)
         v.setContentsMargins(32, 28, 32, 16)
         v.setSpacing(18)
+        self.board_layout = v
 
-        head = QHBoxLayout()
+        self.board_head = QWidget()
+        head = QHBoxLayout(self.board_head)
+        head.setContentsMargins(0, 0, 0, 0)
         tv = QVBoxLayout()
         tv.setSpacing(2)
         tv.addWidget(label("Sound board", "h1"))
@@ -1423,9 +1536,16 @@ class MainWindow(QMainWindow):
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search sounds…")
         self.search.addAction(glyph_icon(G_SEARCH, MUTED, 14), QLineEdit.LeadingPosition)
-        self.search.setFixedWidth(250)
+        self.search.setMinimumWidth(150)
+        self.search.setMaximumWidth(250)
         self.search.textChanged.connect(self._filter)
         head.addWidget(self.search)
+        full = self.full_btn = QPushButton("  Soundboard mode")
+        full.setIcon(glyph_icon(G_FULL, TEXT, 14))
+        full.setCursor(Qt.PointingHandCursor)
+        full.setToolTip("Full-screen pads only (F11)")
+        full.clicked.connect(self.toggle_board_mode)
+        head.addWidget(full)
         add = QPushButton("  Add sounds")
         add.setObjectName("primary")
         add.setIcon(glyph_icon(G_ADD, "white", 14))
@@ -1438,14 +1558,15 @@ class MainWindow(QMainWindow):
         stop.setCursor(Qt.PointingHandCursor)
         stop.clicked.connect(self.engine.stop_all)
         head.addWidget(stop)
-        v.addLayout(head)
+        v.addWidget(self.board_head)
+        v.addWidget(self._build_mode_bar())
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         holder = QWidget()
         hv = QVBoxLayout(holder)
         hv.setContentsMargins(0, 4, 6, 4)
-        self.grid_host = QWidget()
+        self.grid_host = DropGrid(self)
         self.grid = FlowGrid()
         self.grid_host.setLayout(self.grid)
         hv.addWidget(self.grid_host)
@@ -1453,8 +1574,36 @@ class MainWindow(QMainWindow):
         hv.addWidget(self.empty)
         hv.addStretch()
         self.scroll.setWidget(holder)
+        self.scroll.viewport().installEventFilter(self)     # refit pads when the window resizes
         v.addWidget(self.scroll, 1)
         return page
+
+    def _build_mode_bar(self):
+        """Slim bar shown only in Soundboard mode."""
+        self.mode_bar = QWidget()
+        h = QHBoxLayout(self.mode_bar)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(10)
+        logo = QLabel()
+        logo.setPixmap(app_icon().pixmap(26, 26))
+        h.addWidget(logo)
+        h.addWidget(label("SOUNDBOARD MODE", "dim"))
+        h.addStretch()
+        h.addWidget(label("Drag pads to rearrange  ·  Esc to exit", "muted"))
+        h.addSpacing(8)
+        stop = QPushButton("  Stop all")
+        stop.setObjectName("danger")
+        stop.setIcon(glyph_icon(G_STOP, "#ff8fa3", 14))
+        stop.setCursor(Qt.PointingHandCursor)
+        stop.clicked.connect(self.engine.stop_all)
+        h.addWidget(stop)
+        ex = QPushButton("  Exit")
+        ex.setIcon(glyph_icon(G_EXITFULL, TEXT, 14))
+        ex.setCursor(Qt.PointingHandCursor)
+        ex.clicked.connect(self.toggle_board_mode)
+        h.addWidget(ex)
+        self.mode_bar.hide()
+        return self.mode_bar
 
     def _build_empty(self):
         fr = QFrame()
@@ -1803,7 +1952,7 @@ class MainWindow(QMainWindow):
             self.grid.addWidget(pad)
             self.pads[e["name"]] = pad
         n = len(self.cfg["sounds"])
-        self.subtitle.setText(f"{n} sound{'s' if n != 1 else ''}  ·  click a pad to play, right-click to edit")
+        self.subtitle.setText(f"{n} sound{'s' if n != 1 else ''}  ·  right-click a pad to edit, drag to move")
         self._filter(self.search.text())
 
     def _filter(self, text):
@@ -1812,6 +1961,74 @@ class MainWindow(QMainWindow):
             pad.setVisible(t in name.lower())
         self.empty.setVisible(not self.pads)
         self.grid.invalidate()
+
+    # ---------- soundboard mode (full screen, pads only)
+    def toggle_board_mode(self):
+        self.board_mode = on = not self.board_mode
+        if on:
+            self._go(0)
+            self.search.clear()
+            self._was_maximized = self.isMaximized()
+        for w in (self.sidebar, self.mixer, self.board_head):
+            w.setVisible(not on)
+        self.mode_bar.setVisible(on)
+        self.board_layout.setContentsMargins(*((28, 18, 28, 22) if on else (32, 28, 32, 16)))
+        if on:
+            self.showFullScreen()
+        elif self._was_maximized:
+            self.showMaximized()
+        else:
+            self.showNormal()
+        self._update_fit()
+
+    def _update_fit(self):
+        """In Soundboard mode the pads fill the visible area (minus the holder's margins)."""
+        self.grid.fit_h = self.scroll.viewport().height() - 8 if self.board_mode else 0
+        self.grid.invalidate()
+        self.grid_host.updateGeometry()
+
+    def eventFilter(self, obj, e):
+        if obj is self.scroll.viewport() and e.type() == QEvent.Resize and self.board_mode:
+            QTimer.singleShot(0, self._update_fit)
+        return super().eventFilter(obj, e)
+
+    # ---------- rearranging pads
+    def drag_pad(self, pad):
+        if self.search.text().strip():          # order is ambiguous while filtered
+            return
+        mime = QMimeData()
+        mime.setData(DropGrid.MIME, pad.name.encode())
+        snap = pad.grab()
+        ghost = QPixmap(snap.size())
+        ghost.setDevicePixelRatio(snap.devicePixelRatio())
+        ghost.fill(Qt.transparent)
+        gp = QPainter(ghost)
+        gp.setOpacity(0.85)
+        gp.drawPixmap(0, 0, snap)
+        gp.end()
+        drag = QDrag(pad)
+        drag.setMimeData(mime)
+        drag.setPixmap(ghost)
+        drag.setHotSpot(pad.press_pos)
+        pad.dragging = True
+        pad.update()
+        drag.exec(Qt.MoveAction)
+        pad.dragging = False
+        pad.update()
+        save_config(self.cfg)
+
+    def move_pad(self, name, pos):
+        """Called while dragging over the grid: shift the dragged pad into the slot under pos."""
+        dst = self.grid.index_at(pos)
+        src = next((i for i, it in enumerate(self.grid.items)
+                    if getattr(it.widget(), "name", None) == name), None)
+        if dst is None or src is None or src == dst:
+            return
+        self.grid.move(src, dst)
+        snd = self.cfg["sounds"]
+        e = self._entry(name)
+        snd.remove(e)
+        snd.insert(dst, e)
 
     def _tick(self):
         self.s_mic.meter.push(self.engine.take_peak("mic"))
@@ -2141,6 +2358,11 @@ class MainWindow(QMainWindow):
         if paths:
             self._go(0)
             self.import_files(paths)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if hasattr(self, "full_btn"):     # icon only when the header gets tight
+            self.full_btn.setText("" if self.width() < 1150 else "  Soundboard mode")
 
     def showEvent(self, e):
         super().showEvent(e)
