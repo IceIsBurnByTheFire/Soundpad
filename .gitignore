@@ -1,0 +1,8 @@
+config.json
+sounds/
+__pycache__/
+error.log
+.venv/
+dist/
+legacy/
+.DS_Store
