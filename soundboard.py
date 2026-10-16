@@ -580,7 +580,7 @@ class Engine:
         return v
 
     def start(self, mic_i, cable_i, mon_i, buf_ms):
-        self.stop()
+        self.close_streams()
         self.target = max(BLOCK, int(SR * buf_ms / 1000))
         self.mic_ring = Ring(SR, 1)
         self.self_ring = Ring(SR, 1)
@@ -604,10 +604,10 @@ class Engine:
             for s in self.streams:
                 s.start()
         except Exception:
-            self.stop()
+            self.close_streams()
             raise
 
-    def stop(self):
+    def close_streams(self):
         for s in self.streams:
             try:
                 s.stop()
@@ -2150,7 +2150,7 @@ class MainWindow(QMainWindow):
         save_config(self.cfg)
         self._ptt_release()
         self.hk.shutdown()
-        self.engine.stop()
+        self.engine.close_streams()
         super().closeEvent(e)
 
 
